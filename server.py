@@ -17,7 +17,7 @@ app = FastAPI(title="Mem0 — Wave Assistant Memory")
 
 # Use LightRAG's OpenAI-compatible embeddings endpoint (local, no external API)
 LIGHTRAG_INTERNAL = os.getenv("LIGHTRAG_INTERNAL_URL", "http://lightrag.railway.internal:9621")
-EMBEDDING_API_KEY = os.getenv("MEM0_EMBEDDER_API_KEY", "local")  # dummy key, LightRAG doesn't check
+EMBEDDING_API_KEY = os.getenv("MEM0_EMBEDDER_API_KEY", "local")
 
 # Configure Mem0
 config = {
@@ -48,7 +48,16 @@ config = {
 
 logger.info(f"Mem0 config: embedder={LIGHTRAG_INTERNAL}/v1, vector_store=qdrant.railway.internal:6333")
 
-m = Memory.from_config(config)
+# Lazy initialization — don't crash on startup if Theta is down
+_m = None
+
+def get_memory():
+    global _m
+    if _m is None:
+        from mem0 import Memory
+        _m = Memory.from_config(config)
+        logger.info("Mem0 Memory initialized")
+    return _m
 
 
 class AddMemoryRequest(BaseModel):
@@ -76,11 +85,11 @@ async def health():
 async def add_memory(req: AddMemoryRequest):
     """Store a memory from conversation messages."""
     try:
-        result = m.add(req.messages, user_id=req.user_id, metadata=req.metadata)
+        mem = get_memory()
+        result = mem.add(req.messages, user_id=req.user_id, metadata=req.metadata)
         return {"result": result}
     except Exception as e:
         logger.error(f"Add memory error: {e}")
-        # If LLM fails (Theta down), store raw messages as simple text memories
         return {"result": "stored_raw", "error": str(e), "note": "LLM unavailable, stored raw messages"}
 
 
@@ -88,7 +97,8 @@ async def add_memory(req: AddMemoryRequest):
 async def search_memory(req: SearchMemoryRequest):
     """Search memories by semantic similarity."""
     try:
-        results = m.search(req.query, user_id=req.user_id, limit=req.limit)
+        mem = get_memory()
+        results = mem.search(req.query, user_id=req.user_id, limit=req.limit)
         return {"memories": results}
     except Exception as e:
         logger.error(f"Search memory error: {e}")
@@ -99,7 +109,8 @@ async def search_memory(req: SearchMemoryRequest):
 async def get_all_memories(user_id: str):
     """Get all memories for a user."""
     try:
-        results = m.get_all(user_id=user_id)
+        mem = get_memory()
+        results = mem.get_all(user_id=user_id)
         return {"memories": results}
     except Exception as e:
         logger.error(f"Get memories error: {e}")
@@ -109,12 +120,20 @@ async def get_all_memories(user_id: str):
 @app.delete("/delete")
 async def delete_memory(req: DeleteMemoryRequest):
     """Delete a specific memory by ID."""
-    m.delete(req.memory_id)
-    return {"status": "deleted", "memory_id": req.memory_id}
+    try:
+        mem = get_memory()
+        mem.delete(req.memory_id)
+        return {"status": "deleted", "memory_id": req.memory_id}
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
 
 
 @app.delete("/reset/{user_id}")
 async def reset_user_memories(user_id: str):
     """Delete all memories for a user."""
-    m.delete_all(user_id=user_id)
-    return {"status": "reset", "user_id": user_id}
+    try:
+        mem = get_memory()
+        mem.delete_all(user_id=user_id)
+        return {"status": "reset", "user_id": user_id}
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
