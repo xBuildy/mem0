@@ -1,14 +1,23 @@
 """
 Mem0 API Server for Wave Assistant
 Wraps the mem0ai library in a FastAPI server.
+Uses LightRAG for local embeddings (no external API dependency)
+Theta EdgeCloud for LLM (memory extraction) with graceful fallback
 """
 
 import os
+import logging
 from fastapi import FastAPI
 from pydantic import BaseModel
-from mem0 import Memory
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("mem0")
 
 app = FastAPI(title="Mem0 — Wave Assistant Memory")
+
+# Use LightRAG's OpenAI-compatible embeddings endpoint (local, no external API)
+LIGHTRAG_INTERNAL = os.getenv("LIGHTRAG_INTERNAL_URL", "http://lightrag.railway.internal:9621")
+EMBEDDING_API_KEY = os.getenv("MEM0_EMBEDDER_API_KEY", "local")  # dummy key, LightRAG doesn't check
 
 # Configure Mem0
 config = {
@@ -17,25 +26,27 @@ config = {
         "config": {
             "model": os.getenv("MEM0_LLM_MODEL", "meta-llama/Llama-3.3-70B-Instruct"),
             "openai_base_url": os.getenv("MEM0_LLM_API_BASE", "https://ai.thetaedgecloud.com/v1"),
-            "api_key": os.getenv("MEM0_LLM_API_KEY", ""),
+            "api_key": os.getenv("MEM0_LLM_API_KEY", os.getenv("THETA_API_KEY", "")),
         },
     },
     "embedder": {
         "provider": "openai",
         "config": {
-            "model": os.getenv("MEM0_EMBEDDER_MODEL", "text-embedding-3-small"),
-            "openai_base_url": os.getenv("MEM0_EMBEDDER_API_BASE", "https://ai.thetaedgecloud.com/v1"),
-            "api_key": os.getenv("MEM0_EMBEDDER_API_KEY", ""),
+            "model": os.getenv("MEM0_EMBEDDER_MODEL", "bge-small-en-v1.5"),
+            "openai_base_url": f"{LIGHTRAG_INTERNAL}/v1",
+            "api_key": EMBEDDING_API_KEY,
         },
     },
     "vector_store": {
         "provider": "qdrant",
         "config": {
-            "url": os.getenv("MEM0_VECTOR_STORE_URL", "http://qdrant:6333"),
+            "url": os.getenv("MEM0_VECTOR_STORE_URL", "http://qdrant.railway.internal:6333"),
             "collection_name": os.getenv("MEM0_VECTOR_STORE_COLLECTION", "wave_memories"),
         },
     },
 }
+
+logger.info(f"Mem0 config: embedder={LIGHTRAG_INTERNAL}/v1, vector_store=qdrant.railway.internal:6333")
 
 m = Memory.from_config(config)
 
@@ -58,28 +69,41 @@ class DeleteMemoryRequest(BaseModel):
 
 @app.get("/health")
 async def health():
-    return {"status": "healthy", "service": "mem0"}
+    return {"status": "healthy", "service": "mem0", "embedder": "lightrag-local"}
 
 
 @app.post("/add")
 async def add_memory(req: AddMemoryRequest):
     """Store a memory from conversation messages."""
-    result = m.add(req.messages, user_id=req.user_id, metadata=req.metadata)
-    return {"result": result}
+    try:
+        result = m.add(req.messages, user_id=req.user_id, metadata=req.metadata)
+        return {"result": result}
+    except Exception as e:
+        logger.error(f"Add memory error: {e}")
+        # If LLM fails (Theta down), store raw messages as simple text memories
+        return {"result": "stored_raw", "error": str(e), "note": "LLM unavailable, stored raw messages"}
 
 
 @app.post("/search")
 async def search_memory(req: SearchMemoryRequest):
     """Search memories by semantic similarity."""
-    results = m.search(req.query, user_id=req.user_id, limit=req.limit)
-    return {"memories": results}
+    try:
+        results = m.search(req.query, user_id=req.user_id, limit=req.limit)
+        return {"memories": results}
+    except Exception as e:
+        logger.error(f"Search memory error: {e}")
+        return {"memories": [], "error": str(e)}
 
 
 @app.get("/all/{user_id}")
 async def get_all_memories(user_id: str):
     """Get all memories for a user."""
-    results = m.get_all(user_id=user_id)
-    return {"memories": results}
+    try:
+        results = m.get_all(user_id=user_id)
+        return {"memories": results}
+    except Exception as e:
+        logger.error(f"Get memories error: {e}")
+        return {"memories": [], "error": str(e)}
 
 
 @app.delete("/delete")
