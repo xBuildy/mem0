@@ -19,6 +19,9 @@ app = FastAPI(title="Mem0 — Wave Assistant Memory")
 LIGHTRAG_INTERNAL = os.getenv("LIGHTRAG_INTERNAL_URL", "http://lightrag.railway.internal:9621")
 EMBEDDING_API_KEY = os.getenv("MEM0_EMBEDDER_API_KEY", "local")
 
+# Set short timeout so Theta failures don't hang (5s)
+os.environ.setdefault("OPENAI_TIMEOUT", "5")
+
 # Configure Mem0
 config = {
     "llm": {
@@ -27,6 +30,7 @@ config = {
             "model": os.getenv("MEM0_LLM_MODEL", "meta-llama/Llama-3.3-70B-Instruct"),
             "openai_base_url": os.getenv("MEM0_LLM_API_BASE", "https://ai.thetaedgecloud.com/v1"),
             "api_key": os.getenv("MEM0_LLM_API_KEY", os.getenv("THETA_API_KEY", "")),
+            "timeout": 5,  # 5 second timeout for LLM calls
         },
     },
     "embedder": {
@@ -46,7 +50,7 @@ config = {
     },
 }
 
-logger.info(f"Mem0 config: embedder={LIGHTRAG_INTERNAL}/v1, vector_store=qdrant.railway.internal:6333")
+logger.info(f"Mem0 config: embedder={LIGHTRAG_INTERNAL}/v1, vector_store=qdrant.railway.internal:6333, llm_timeout=5s")
 
 _m = None
 
@@ -97,7 +101,6 @@ async def search_memory(req: SearchMemoryRequest):
     """Search memories by semantic similarity."""
     try:
         mem = get_memory()
-        # Try new API with filters, fall back to old API
         try:
             results = mem.search(req.query, filters={"user_id": req.user_id}, limit=req.limit)
         except (TypeError, AttributeError):
