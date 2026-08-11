@@ -1,0 +1,48 @@
+# ============================================================
+# Mem0 — Long-Term Memory for Wave Assistant
+# ============================================================
+# Stores user preferences, facts, and conversation context.
+# Uses Qdrant as vector backend for semantic memory retrieval.
+# ============================================================
+
+services:
+  mem0:
+    build: .
+    container_name: mem0
+    restart: unless-stopped
+    ports:
+      - '8012:8012'
+    environment:
+      # --- LLM Config (Theta EdgeCloud GLM-5.2) ---
+      - MEM0_LLM_PROVIDER=openai
+      - MEM0_LLM_MODEL=meta-llama/Llama-3.3-70B-Instruct
+      - MEM0_LLM_API_BASE=https://ai.thetaedgecloud.com/v1
+      - MEM0_LLM_API_KEY=${THETA_API_KEY}
+      
+      # --- Embedding Config (Theta EdgeCloud) ---
+      - MEM0_EMBEDDER_PROVIDER=openai
+      - MEM0_EMBEDDER_MODEL=text-embedding-3-small
+      - MEM0_EMBEDDER_API_BASE=https://ai.thetaedgecloud.com/v1
+      - MEM0_EMBEDDER_API_KEY=${THETA_API_KEY}
+      
+      # --- Vector Store (Qdrant) ---
+      - MEM0_VECTOR_STORE_PROVIDER=qdrant
+      - MEM0_VECTOR_STORE_URL=http://qdrant:6333
+      - MEM0_VECTOR_STORE_COLLECTION=wave_memories
+      
+      # --- Server ---
+      - HOST=0.0.0.0
+      - PORT=8012
+      
+      # --- Memory Config ---
+      - MEM0_HISTORY_DB_PATH=/app/data/mem0.db
+      - MEM0_MAX_RESULTS=10
+      - MEM0_SIMILARITY_THRESHOLD=0.7
+    
+    volumes:
+      - mem0_data:/app/data
+    depends_on:
+      - qdrant
+
+volumes:
+  mem0_data:
