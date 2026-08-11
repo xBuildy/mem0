@@ -1,81 +1,34 @@
 """
-Mem0 API Server for Wave Assistant
-Wraps the mem0ai library in a FastAPI server.
-Uses LightRAG for local embeddings (no external API dependency)
-Theta EdgeCloud for LLM (memory extraction) with graceful fallback + 10s timeout
+Mem0 API Server for Wave Assistant — v2 (no mem0ai dependency)
+Direct Qdrant + LightRAG local embeddings. No external API needed.
+When Theta recovers, LLM extraction can be added back as an enhancement.
 """
 
 import os
+import uuid
 import logging
-import asyncio
-from functools import partial
-from fastapi import FastAPI
+from typing import Optional, List
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
-logging.basicConfig(level=logging=logging.INFO)
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("mem0")
 
 app = FastAPI(title="Mem0 — Wave Assistant Memory")
 
-# Use LightRAG's OpenAI-compatible embeddings endpoint (local, no external API)
-LIGHTRAG_INTERNAL = os.getenv("LIGHTRAG_INTERNAL_URL", "http://lightrag.railway.internal:9621")
-EMBEDDING_API_KEY = os.getenv("MEM0_EMBEDDER_API_KEY", "local")
+# LightRAG for local embeddings
+LIGHTRAG_URL = os.getenv("LIGHTRAG_INTERNAL_URL", "http://lightrag.railway.internal:9621")
+LIGHTRAG_PUBLIC = os.getenv("LIGHTRAG_URL", "https://lightrag-production-2b43.up.railway.app")
 
-# Configure Mem0
-config = {
-    "llm": {
-        "provider": "openai",
-        "config": {
-            "model": os.getenv("MEM0_LLM_MODEL", "meta-llama/Llama-3.3-70B-Instruct"),
-            "openai_base_url": os.getenv("MEM0_LLM_API_BASE", "https://ai.thetaedgecloud.com/v1"),
-            "api_key": os.getenv("MEM0_LLM_API_KEY", os.getenv("THETA_API_KEY", "")),
-        },
-    },
-    "embedder": {
-        "provider": "openai",
-        "config": {
-            "model": os.getenv("MEM0_EMBEDDER_MODEL", "bge-small-en-v1.5"),
-            "openai_base_url": f"{LIGHTRAG_INTERNAL}/v1",
-            "api_key": EMBEDDING_API_KEY,
-        },
-    },
-    "vector_store": {
-        "provider": "qdrant",
-        "config": {
-            "url": os.getenv("MEM0_VECTOR_STORE_URL", "http://qdrant.railway.internal:6333"),
-            "collection_name": os.getenv("MEM0_VECTOR_STORE_COLLECTION", "wave_memories"),
-        },
-    },
-}
+# Qdrant
+QDRANT_URL = os.getenv("MEM0_VECTOR_STORE_URL", "http://qdrant.railway.internal:6333")
+QDRANT_COLLECTION = os.getenv("MEM0_VECTOR_STORE_COLLECTION", "wave_memories")
+EMBEDDING_DIM = 384
 
-logger.info(f"Mem0 config: embedder={LIGHTRAG_INTERNAL}/v1, vector_store=qdrant.railway.internal:6333")
-
-_m = None
-
-def get_memory():
-    global _m
-    if _m is None:
-        from mem0 import Memory
-        _m = Memory.from_config(config)
-        logger.info("Mem0 Memory initialized")
-    return _m
-
-
-async def run_with_timeout(func, *args, timeout_sec=10, **kwargs):
-    """Run a blocking function with a timeout in a thread pool"""
-    loop = asyncio.get_event_loop()
-    try:
-        result = await asyncio.wait_for(
-            loop.run_in_executor(None, partial(func, *args, **kwargs)),
-            timeout=timeout_sec
-        )
-        return result
-    except asyncio.TimeoutError:
-        raise TimeoutError(f"Operation timed out after {timeout_sec}s")
-
+import httpx
 
 class AddMemoryRequest(BaseModel):
-    messages: list
+    messages: list  # list of {role, content}
     user_id: str = "default"
     metadata: dict = {}
 
@@ -92,42 +45,106 @@ class DeleteMemoryRequest(BaseModel):
 
 @app.get("/health")
 async def health():
-    return {"status": "healthy", "service": "mem0", "embedder": "lightrag-local"}
+    return {"status": "healthy", "service": "mem0", "embedder": "lightrag-local", "mode": "direct-qdrant"}
+
+
+async def get_embedding(text: str) -> list:
+    """Get embedding from LightRAG's OpenAI-compatible endpoint"""
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.post(
+            f"{LIGHTRAG_URL}/v1/embeddings",
+            json={"model": "bge-small", "input": text}
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        return data["data"][0]["embedding"]
+
+
+def get_qdrant():
+    from qdrant_client import QdrantClient
+    from qdrant_client.models import Distance, VectorParams
+    client = QdrantClient(url=QDRANT_URL, timeout=30)
+    # Ensure collection exists with 384 dims
+    try:
+        client.get_collection(QDRANT_COLLECTION)
+    except Exception:
+        client.create_collection(
+            collection_name=QDRANT_COLLECTION,
+            vectors_config=VectorParams(size=EMBEDDING_DIM, distance=Distance.COSINE),
+        )
+        logger.info(f"Created Qdrant collection: {QDRANT_COLLECTION} ({EMBEDDING_DIM}d)")
+    return client
 
 
 @app.post("/add")
 async def add_memory(req: AddMemoryRequest):
-    """Store a memory from conversation messages."""
+    """Store memories directly from conversation messages (no LLM extraction)."""
     try:
-        mem = get_memory()
-        result = await run_with_timeout(
-            mem.add, req.messages, user_id=req.user_id, metadata=req.metadata, timeout_sec=10
-        )
-        return {"result": result}
-    except TimeoutError:
-        logger.warning("Add memory timed out (Theta LLM likely down)")
-        return {"result": "timeout", "error": "LLM timed out", "note": "Theta EdgeCloud unavailable, memory not stored. Will retry when LLM is back."}
+        from qdrant_client.models import PointStruct
+        client = get_qdrant()
+        
+        # Extract text from messages and store each as a memory
+        points = []
+        memories_stored = []
+        for msg in req.messages:
+            role = msg.get("role", "unknown")
+            content = msg.get("content", "")
+            if not content:
+                continue
+            
+            # Create a memory text combining role and content
+            memory_text = f"[{role}] {content}"
+            embedding = await get_embedding(memory_text)
+            
+            point_id = str(uuid.uuid4())
+            payload = {
+                "text": memory_text,
+                "role": role,
+                "content": content,
+                "user_id": req.user_id,
+                **req.metadata,
+            }
+            points.append(PointStruct(id=point_id, vector=embedding, payload=payload))
+            memories_stored.append({"id": point_id, "text": memory_text[:100]})
+        
+        if points:
+            client.upsert(collection_name=QDRANT_COLLECTION, points=points)
+            logger.info(f"Stored {len(points)} memories for user {req.user_id}")
+        
+        return {"result": "success", "memories_added": len(points), "memories": memories_stored}
     except Exception as e:
         logger.error(f"Add memory error: {e}")
-        return {"result": "error", "error": str(e), "note": "LLM unavailable"}
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/search")
 async def search_memory(req: SearchMemoryRequest):
     """Search memories by semantic similarity."""
     try:
-        mem = get_memory()
-        try:
-            results = await run_with_timeout(
-                mem.search, req.query, filters={"user_id": req.user_id}, limit=req.limit, timeout_sec=10
-            )
-        except (TypeError, AttributeError):
-            results = await run_with_timeout(
-                mem.search, req.query, user_id=req.user_id, limit=req.limit, timeout_sec=10
-            )
-        return {"memories": results}
-    except TimeoutError:
-        return {"memories": [], "error": "Search timed out"}
+        client = get_qdrant()
+        query_embedding = await get_embedding(req.query)
+        
+        # Use query_points (new API) with user_id filter
+        from qdrant_client.models import Filter, FieldCondition, MatchValue
+        results = client.query_points(
+            collection_name=QDRANT_COLLECTION,
+            query=query_embedding,
+            limit=req.limit,
+            query_filter=Filter(must=[FieldCondition(key="user_id", match=MatchValue(value=req.user_id))]),
+        )
+        
+        memories = [
+            {
+                "id": r.id,
+                "text": r.payload.get("text", "") if r.payload else "",
+                "content": r.payload.get("content", "") if r.payload else "",
+                "role": r.payload.get("role", "") if r.payload else "",
+                "score": r.score,
+                "metadata": {k: v for k, v in (r.payload or {}).items() if k not in ("text", "content", "role", "user_id")},
+            }
+            for r in results.points
+        ]
+        return {"memories": memories}
     except Exception as e:
         logger.error(f"Search memory error: {e}")
         return {"memories": [], "error": str(e)}
@@ -137,18 +154,25 @@ async def search_memory(req: SearchMemoryRequest):
 async def get_all_memories(user_id: str):
     """Get all memories for a user."""
     try:
-        mem = get_memory()
-        try:
-            results = await run_with_timeout(
-                mem.get_all, filters={"user_id": user_id}, timeout_sec=10
-            )
-        except (TypeError, AttributeError):
-            results = await run_with_timeout(
-                mem.get_all, user_id=user_id, timeout_sec=10
-            )
-        return {"memories": results}
-    except TimeoutError:
-        return {"memories": [], "error": "Timed out"}
+        client = get_qdrant()
+        from qdrant_client.models import Filter, FieldCondition, MatchValue, ScrollRequest
+        results = client.scroll(
+            collection_name=QDRANT_COLLECTION,
+            scroll_filter=Filter(must=[FieldCondition(key="user_id", match=MatchValue(value=user_id))]),
+            limit=100,
+        )
+        
+        memories = [
+            {
+                "id": r.id,
+                "text": r.payload.get("text", "") if r.payload else "",
+                "content": r.payload.get("content", "") if r.payload else "",
+                "role": r.payload.get("role", "") if r.payload else "",
+                "metadata": {k: v for k, v in (r.payload or {}).items() if k not in ("text", "content", "role", "user_id")},
+            }
+            for r in results[0]
+        ]
+        return {"memories": memories}
     except Exception as e:
         logger.error(f"Get memories error: {e}")
         return {"memories": [], "error": str(e)}
@@ -158,8 +182,8 @@ async def get_all_memories(user_id: str):
 async def delete_memory(req: DeleteMemoryRequest):
     """Delete a specific memory by ID."""
     try:
-        mem = get_memory()
-        mem.delete(req.memory_id)
+        client = get_qdrant()
+        client.delete(collection_name=QDRANT_COLLECTION, points=[req.memory_id])
         return {"status": "deleted", "memory_id": req.memory_id}
     except Exception as e:
         return {"status": "error", "error": str(e)}
@@ -169,8 +193,12 @@ async def delete_memory(req: DeleteMemoryRequest):
 async def reset_user_memories(user_id: str):
     """Delete all memories for a user."""
     try:
-        mem = get_memory()
-        mem.delete_all(user_id=user_id)
+        client = get_qdrant()
+        from qdrant_client.models import Filter, FieldCondition, MatchValue
+        client.delete(
+            collection_name=QDRANT_COLLECTION,
+            points_selector=Filter(must=[FieldCondition(key="user_id", match=MatchValue(value=user_id))]),
+        )
         return {"status": "reset", "user_id": user_id}
     except Exception as e:
         return {"status": "error", "error": str(e)}

@@ -2,7 +2,7 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-RUN pip install --no-cache-dir mem0ai fastapi uvicorn
+RUN pip install --no-cache-dir fastapi uvicorn httpx qdrant-client
 
 COPY server.py .
 
