@@ -48,7 +48,6 @@ config = {
 
 logger.info(f"Mem0 config: embedder={LIGHTRAG_INTERNAL}/v1, vector_store=qdrant.railway.internal:6333")
 
-# Lazy initialization — don't crash on startup if Theta is down
 _m = None
 
 def get_memory():
@@ -98,7 +97,11 @@ async def search_memory(req: SearchMemoryRequest):
     """Search memories by semantic similarity."""
     try:
         mem = get_memory()
-        results = mem.search(req.query, user_id=req.user_id, limit=req.limit)
+        # Try new API with filters, fall back to old API
+        try:
+            results = mem.search(req.query, filters={"user_id": req.user_id}, limit=req.limit)
+        except (TypeError, AttributeError):
+            results = mem.search(req.query, user_id=req.user_id, limit=req.limit)
         return {"memories": results}
     except Exception as e:
         logger.error(f"Search memory error: {e}")
@@ -110,7 +113,10 @@ async def get_all_memories(user_id: str):
     """Get all memories for a user."""
     try:
         mem = get_memory()
-        results = mem.get_all(user_id=user_id)
+        try:
+            results = mem.get_all(filters={"user_id": user_id})
+        except (TypeError, AttributeError):
+            results = mem.get_all(user_id=user_id)
         return {"memories": results}
     except Exception as e:
         logger.error(f"Get memories error: {e}")
